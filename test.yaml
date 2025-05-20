@@ -1,0 +1,204 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Audio Transcription and Summary Workflow'
+
+Parameters:
+  # S3 Bucket Names
+  InputAudioBucketName:
+    Type: String
+    Description: Name of the input audio S3 bucket
+    Default: input-audio-123456789-987654321
+
+  TranscribeOutputBucketName:
+    Type: String
+    Description: Name of the transcribe output S3 bucket
+    Default: transcribe-output-123456789-987654321
+
+  SummaryOutputBucketName:
+    Type: String
+    Description: Name of the summary output S3 bucket
+    Default: finished-result-of-audio-123456789-987654321
+
+Resources:
+  # S3 Buckets
+  InputAudioBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref InputAudioBucketName
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: s3:ObjectCreated:*
+            Queue: !GetAtt SQSQueue.Arn
+
+  TranscribeOutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref TranscribeOutputBucketName
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt TranscribeToBedrockLambda.Arn
+
+  SummaryOutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref SummaryOutputBucketName
+
+  # SQS Queue
+  SQSQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: sqs-to-lambda
+      MessageRetentionPeriod: 345600  # 4 days
+      VisibilityTimeout: 30
+
+  # IAM Roles
+  DataToTranscribeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DataToTranscribePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub 'arn:aws:s3:::${InputAudioBucketName}/*'
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt SQSQueue.Arn
+              - Effect: Allow
+                Action:
+                  - transcribe:StartTranscriptionJob
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub 'arn:aws:s3:::${TranscribeOutputBucketName}/*'
+
+  TranscribeToBedrockRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: TranscribeToBedrockPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: 
+                  - !Sub 'arn:aws:s3:::${TranscribeOutputBucketName}/*'
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub 'arn:aws:s3:::${SummaryOutputBucketName}/*'
+
+  # Lambda Functions
+  DataToTranscribeLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: sqs-to-transcribe
+      Runtime: python3.9
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt DataToTranscribeRole.Arn
+      Code:
+        S3Bucket: transcribe-test-bucket-wise
+        S3Key: transcribe.zip
+      Timeout: 60
+      MemorySize: 128
+
+  TranscribeToBedrockLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: transcribe-to-bedrock
+      Runtime: python3.9
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt TranscribeToBedrockRole.Arn
+      Code:
+        S3Bucket: transcribe-test-bucket-wise
+        S3Key: summarize.zip
+      Timeout: 300
+      MemorySize: 128
+
+  # Lambda Event Source Mapping
+  SQSEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 10
+      Enabled: true
+      EventSourceArn: !GetAtt SQSQueue.Arn
+      FunctionName: !GetAtt DataToTranscribeLambda.Arn
+
+  # Permissions
+  DataToTranscribeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DataToTranscribeLambda
+      Principal: sqs.amazonaws.com
+      SourceArn: !GetAtt SQSQueue.Arn
+
+  TranscribeToBedrockLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref TranscribeToBedrockLambda
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt TranscribeOutputBucket.Arn
+
+Outputs:
+  InputAudioBucketName:
+    Description: Input Audio Bucket Name
+    Value: !Ref InputAudioBucket
+
+  TranscribeOutputBucketName:
+    Description: Transcribe Output Bucket Name
+    Value: !Ref TranscribeOutputBucket
+
+  SummaryOutputBucketName:
+    Description: Summary Output Bucket Name
+    Value: !Ref SummaryOutputBucket
+
+  SQSQueueURL:
+    Description: SQS Queue URL
+    Value: !Ref SQSQueue
+
+  DataToTranscribeLambdaArn:
+    Description: Data to Transcribe Lambda Function ARN
+    Value: !GetAtt DataToTranscribeLambda.Arn
+
+  TranscribeToBedrockLambdaArn:
+    Description: Transcribe to Bedrock Lambda Function ARN
+    Value: !GetAtt TranscribeToBedrockLambda.Arn
